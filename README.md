@@ -2,6 +2,10 @@
 <h3 align="center">Never Too Late for Force:<br>Accelerating VLA Post-Training with Reactive Force Injection</h3>
 
 <p align="center">
+  🎉 <strong>CoRL 2026 Spotlight (Top 10%)</strong>
+</p>
+
+<p align="center">
   <a href="https://y-wng.github.io/">Yi Wang</a><sup>12*</sup>,
   <a href="https://wendichen.me">Wendi Chen</a><sup>12*‡</sup>,
   <a href="https://github.com/nssmd">Zimo Wen</a><sup>14*</sup>,
@@ -50,8 +54,8 @@ not a robot-control or data-collection stack.
 Use Linux, Python 3.11.8 or newer within the 3.11 series, CUDA-capable NVIDIA GPUs, and `uv`.
 
 ```bash
-git clone https://github.com/y-wng/lift.git
-cd lift
+git clone https://github.com/y-wng/LIFT.git
+cd LIFT
 GIT_LFS_SKIP_SMUDGE=1 uv sync --locked
 ```
 

@@ -47,7 +47,7 @@ legacy-data = ["pymongo>=4.10,<5", "transforms3d>=0.4.2"]
 
 
 [project.urls]
-Repository = "https://github.com/y-wng/lift"
+Repository = "https://github.com/y-wng/LIFT"
 
 [dependency-groups]
 dev = [
