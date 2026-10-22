@@ -61,7 +61,8 @@ dev = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# lerobot (pinned rev) stacks hf_dataset columns with torch.stack, which datasets>=4 breaks (columns become Column objects).
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "datasets>=3,<4"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
