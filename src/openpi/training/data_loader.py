@@ -115,8 +115,10 @@ def create_torch_dataset(
             repo_id,
             missing_keys,
         )
-    if "actions" not in action_sequence_keys:
-        raise ValueError(f"Dataset {repo_id} does not contain the required 'actions' feature.")
+    if data_config.action_sequence_keys[0] not in action_sequence_keys:
+        raise ValueError(
+            f"Dataset {repo_id} does not contain the required '{data_config.action_sequence_keys[0]}' feature."
+        )
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={key: [t / dataset_meta.fps for t in range(action_horizon)] for key in action_sequence_keys},

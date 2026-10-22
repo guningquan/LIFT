@@ -43,17 +43,20 @@ class SingleiPhoneFlexivInputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         left_wrist_image = _parse_image(data["observation/left_wrist_image"])
+        # Optional third-person view; without it the base slot stays zero-filled and masked.
+        has_base = "observation/base_image" in data
+        base_image = _parse_image(data["observation/base_image"]) if has_base else np.zeros_like(left_wrist_image)
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": data["observation/state"],
             "image": {
-                "base_0_rgb": np.zeros_like(left_wrist_image),
+                "base_0_rgb": base_image,
                 "left_wrist_0_rgb": left_wrist_image,
                 "right_wrist_0_rgb": np.zeros_like(left_wrist_image),
             },
             "image_mask": {
-                "base_0_rgb": np.False_,
+                "base_0_rgb": np.bool_(has_base),
                 "left_wrist_0_rgb": np.True_,
                 "right_wrist_0_rgb": np.False_,
             },

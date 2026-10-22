@@ -37,9 +37,11 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.aloha_joint_policy as aloha_joint_policy
 from openpi.policies.flexiv_transforms import ACTION_NAMES
 import openpi.policies.single_iphone_flexiv_policy as single_iphone_flexiv_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 from openpi.shared.episode_schema import DEFAULT_INTERVENTION_VALUE
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -60,6 +62,12 @@ _DEFAULT_TOWEL_CHECKPOINT_DIR = pathlib.Path(
 ).expanduser()
 _DEFAULT_TOWEL_REPO_ID = os.environ.get("OPENPI_TOWEL_REPO_ID", "flexiv/towelv3_100")
 _DEFAULT_TOWEL_ASSET_ID = os.environ.get("OPENPI_TOWEL_ASSET_ID", "flexiv/towelv3_100")
+# ALOHA board insertion: the reactive stage initializes from the offline stage's params/ directory.
+# The default is the final step of `scripts/train.py pi05_aloha_board_insertion_right --exp-name offline`.
+_DEFAULT_ALOHA_OFFLINE_PARAMS = os.environ.get(
+    "OPENPI_ALOHA_OFFLINE_PARAMS",
+    str(_DEFAULT_CHECKPOINT_ROOT / "pi05_aloha_board_insertion_right/offline/29999/params"),
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -239,6 +247,8 @@ class LeRobotSingleiPhoneFlexivDataConfig(DataConfigFactory):
 
     extra_delta_transform: bool = True
     use_wrench: bool = False
+    # Optional third-person image feature for the base_0_rgb slot (e.g. "agentview_img" in MimicGen data).
+    base_image_key: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig, *args, **kwargs) -> DataConfig:
@@ -255,6 +265,8 @@ class LeRobotSingleiPhoneFlexivDataConfig(DataConfigFactory):
             "actions": "actions",
             "prompt": "task",
         }
+        if self.base_image_key is not None:
+            repack_structure["observation/base_image"] = self.base_image_key
         if include_wrench:
             repack_structure["wrench"] = "left_wrench"
 
@@ -276,6 +288,62 @@ class LeRobotSingleiPhoneFlexivDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAlohaJointDataConfig(DataConfigFactory):
+    """Map ALOHA-style joint-space LeRobot samples to policy inputs.
+
+    Expects `observation.state` and `action` holding joint positions with the
+    gripper last, and image features named in `cameras`. Joint dimensions are
+    trained as deltas from the current state; the gripper stays absolute.
+
+    Reactive models additionally read the 6D `wrench_key` sequence over the
+    action horizon, as LeRobotSingleiPhoneFlexivDataConfig does with left_wrench.
+    """
+
+    # Model camera slot -> dataset image feature. Unlisted slots are zero-filled and masked.
+    cameras: tuple[tuple[str, str], ...] = (
+        ("base_0_rgb", "observation.images.cam_high"),
+        ("right_wrist_0_rgb", "observation.images.cam_right_wrist"),
+    )
+    # Names of the dataset action dimensions, used for trajectory plots and output slicing.
+    action_names: tuple[str, ...] = ("j1", "j2", "j3", "j4", "j5", "j6", "gripper")
+    # Delta mask over action_names; see transforms.make_bool_mask. None keeps absolute actions.
+    delta_action_mask: tuple[bool, ...] | None = _transforms.make_bool_mask(6, -1)
+    # Dataset feature holding the 6D wrench. Read when use_wrench is set or the model is reactive.
+    wrench_key: str = "left_wrench"
+    use_wrench: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        include_wrench = self.use_wrench or getattr(model_config, "reactive_in_use", False)
+        repack_structure = {
+            "observation/state": "observation.state",
+            **{f"observation/images/{slot}": key for slot, key in self.cameras},
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if include_wrench:
+            repack_structure["wrench"] = self.wrench_key
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
+        data_transforms = _transforms.Group(
+            inputs=[aloha_joint_policy.AlohaJointInputs(model_type=model_config.model_type)],
+            outputs=[aloha_joint_policy.AlohaJointOutputs(action_dim=len(self.action_names))],
+        )
+        if self.delta_action_mask is not None:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(self.delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(self.delta_action_mask)],
+            )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            action_names=self.action_names,
+            action_sequence_keys=("action", self.wrench_key) if include_wrench else ("action",),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
         )
 
 
@@ -500,6 +568,54 @@ pi05_residual_debug = dataclasses.replace(
     residual_num_heads=4,
     residual_dropout_rate=0.0,
     residual_wrench_hidden_dim=32,
+)
+
+# ALOHA joint-space policy. Joint actions are deltas from the current state, so the
+# state is fed to the model as discrete prompt tokens (discrete_state_input=True).
+pi05_aloha = pi0_config.Pi0Config(
+    pi05=True,
+    action_horizon=10,
+    discrete_state_input=True,
+    reactive_in_use=False,
+    use_state=False,
+    original_head=False,
+    cross_attention_latency=3,
+)
+
+# MimicGen (robosuite) single-arm data replayed at LIFT's 10 Hz with the 6D wrist wrench; see
+# preprocess_data/mimicgen_replay.py. Same model settings as the Flexiv presets: absolute eef
+# actions become relative poses, and the state is zeroed by the transform.
+pi05_mimicgen = pi0_config.Pi0Config(
+    pi05=True,
+    action_horizon=10,
+    discrete_state_input=False,
+    reactive_in_use=False,
+    use_state=False,
+    original_head=False,
+    cross_attention_latency=3,
+)
+_MIMICGEN_COFFEE_DATA = LeRobotSingleiPhoneFlexivDataConfig(
+    repo_id="mimicgen_coffee_d0_10hz_lerobot",
+    base_config=DataConfig(prompt_from_task=True),
+    extra_delta_transform=True,
+    base_image_key="agentview_img",
+)
+# Stage-2 comparisons freeze the same backbone: SigLIP and the PaliGemma expert (llm params without
+# a _1/_2 suffix). Everything on the action side trains: the action expert (_1), the action/time
+# projections, and, when present, the reactive expert (_2), force cross-attention and wrench_gru.
+# Force-free and force-aware variants therefore differ only in the force pathway.
+_FREEZE_MIMICGEN_BACKBONE = nnx.Any(
+    nnx_utils.PathRegex(".*img.*"),
+    nnx.All(
+        nnx_utils.PathRegex(".*llm.*"),
+        nnx.Not(nnx_utils.PathRegex(".*llm.*_[12].*")),
+        nnx.Not(nnx_utils.PathRegex(".*llm.*cross.*")),
+    ),
+)
+# The reactive stage initializes from the offline stage's final params/ directory.
+_DEFAULT_MIMICGEN_COFFEE_OFFLINE_PARAMS = os.environ.get(
+    "OPENPI_MIMICGEN_COFFEE_OFFLINE_PARAMS",
+    str(_DEFAULT_CHECKPOINT_ROOT / "pi05_mimicgen_coffee/offline/29999/params"),
 )
 
 # Use `get_config` if you need to get a config by name in your
@@ -731,6 +847,255 @@ _CONFIGS = [
         # data-parallel devices to avoid FSDP all-gathers for every train step.
         fsdp_devices=1,
         online_use_wrench=True,
+    ),
+    # ALOHA right-arm board insertion with HF_LEROBOT_HOME=/mnt/ssd2/guningquan/Dataset.
+    # The dataset's left_wrench is a synthetic impedance proxy (see meta/synthetic_wrench.json).
+    # Stage 1: offline pi05 without force.
+    TrainConfig(
+        name="pi05_aloha_board_insertion_right",
+        model=pi05_aloha,
+        data=LeRobotAlohaJointDataConfig(
+            repo_id="board_insertion_right_force_10hz_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+    ),
+    # Stage 2: LIFT reactive expert copied from the stage-1 action expert, with force cross-attention.
+    # Override the stage-1 params path with OPENPI_ALOHA_OFFLINE_PARAMS.
+    TrainConfig(
+        name="pi05_aloha_board_insertion_right_reactive",
+        model=dataclasses.replace(pi05_aloha, reactive_in_use=True),
+        data=LeRobotAlohaJointDataConfig(
+            repo_id="board_insertion_right_force_10hz_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(_DEFAULT_ALOHA_OFFLINE_PARAMS),
+        copy_reactive_from_action_expert=True,
+        num_train_steps=30_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+    ),
+    # Fast stage-1 pipeline check on two shared GPUs: real pi05 weights, but SigLIP and the PaliGemma
+    # expert are frozen (only the action expert, `_1`, and the action/time projections train). The
+    # checkpoint has the full stage-1 layout, so the reactive config can load it via
+    # --weight-loader.params-path <checkpoint-dir>/<step>/params.
+    TrainConfig(
+        name="pi05_aloha_board_insertion_right_debug",
+        model=pi05_aloha,
+        data=LeRobotAlohaJointDataConfig(
+            repo_id="board_insertion_right_force_10hz_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_aloha_board_insertion_right",
+                asset_id="board_insertion_right_force_10hz_lerobot",
+            ),
+        ),
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*img.*"),
+            nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*"))),
+        ),
+        batch_size=2,
+        num_workers=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1, peak_lr=5e-5, decay_steps=10, decay_lr=5e-6),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        overwrite=True,
+        log_interval=1,
+        save_interval=100_000,
+        num_train_steps=10,
+        fsdp_devices=2,
+        wandb_enabled=False,
+    ),
+    # Fast stage-2 pipeline check on one GPU, initialized from the stage-1 debug checkpoint above. SigLIP,
+    # PaliGemma, and the action expert (`_1`) are frozen; the LIFT additions train: the reactive expert
+    # (`_2`, copied from `_1` at start), force cross-attention, wrench_gru, and the shared action/time projections.
+    TrainConfig(
+        name="pi05_aloha_board_insertion_right_reactive_frozen_debug",
+        model=dataclasses.replace(pi05_aloha, reactive_in_use=True),
+        data=LeRobotAlohaJointDataConfig(
+            repo_id="board_insertion_right_force_10hz_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_aloha_board_insertion_right_reactive",
+                asset_id="board_insertion_right_force_10hz_lerobot",
+            ),
+        ),
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*llm.*_2.*")),
+                nnx.Not(nnx_utils.PathRegex(".*llm.*cross.*")),
+            ),
+        ),
+        batch_size=2,
+        num_workers=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1, peak_lr=5e-5, decay_steps=10, decay_lr=5e-6),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            str(_DEFAULT_CHECKPOINT_ROOT / "pi05_aloha_board_insertion_right_debug/debug/9/params")
+        ),
+        copy_reactive_from_action_expert=True,
+        overwrite=True,
+        log_interval=1,
+        save_interval=100_000,
+        num_train_steps=10,
+        fsdp_devices=1,
+        wandb_enabled=False,
+    ),
+    # Single-GPU smoke test of the reactive data path and model code: dummy-size experts, no pretrained weights.
+    TrainConfig(
+        name="pi05_aloha_board_insertion_right_reactive_debug",
+        model=dataclasses.replace(
+            pi05_aloha,
+            reactive_in_use=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            reactive_action_expert_variant="dummy",
+            cross_attention_config="dummy",
+        ),
+        data=LeRobotAlohaJointDataConfig(
+            repo_id="board_insertion_right_force_10hz_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="assets/pi05_aloha_board_insertion_right_reactive",
+                asset_id="board_insertion_right_force_10hz_lerobot",
+            ),
+        ),
+        batch_size=2,
+        num_workers=2,
+        lr_schedule=_optimizer.RsqrtDecaySchedule(warmup_steps=1, peak_lr=5e-5, timescale=10),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        copy_reactive_from_action_expert=True,
+        overwrite=True,
+        save_interval=5,
+        log_interval=1,
+        keep_period=5,
+        num_train_steps=10,
+        fsdp_devices=1,
+        wandb_enabled=False,
+    ),
+    # MimicGen Coffee (pod insertion + lid closing), 10 Hz, wrist + agentview cameras, 6D wrist wrench.
+    # Stage 1: offline pi05 without force (LIFT's offline recipe).
+    TrainConfig(
+        name="pi05_mimicgen_coffee",
+        model=pi05_mimicgen,
+        data=_MIMICGEN_COFFEE_DATA,
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+    ),
+    # Stage 2: LIFT reactive expert copied from the stage-1 action expert, with force cross-attention.
+    # Override the stage-1 params path with OPENPI_MIMICGEN_COFFEE_OFFLINE_PARAMS.
+    TrainConfig(
+        name="pi05_mimicgen_coffee_reactive",
+        model=dataclasses.replace(pi05_mimicgen, reactive_in_use=True),
+        data=_MIMICGEN_COFFEE_DATA,
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(_DEFAULT_MIMICGEN_COFFEE_OFFLINE_PARAMS),
+        copy_reactive_from_action_expert=True,
+        num_train_steps=30_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+    ),
+    # Stage-2 comparison pair from the stage-1 checkpoint, same frozen backbone and recipe:
+    # the force-free baseline continues training without wrench input...
+    TrainConfig(
+        name="pi05_mimicgen_coffee_noforce_frozen",
+        model=pi05_mimicgen,
+        data=dataclasses.replace(
+            _MIMICGEN_COFFEE_DATA,
+            # Reuse the stage-1 statistics so the continued policy keeps its action normalization.
+            assets=AssetsConfig(assets_dir="assets/pi05_mimicgen_coffee", asset_id="mimicgen_coffee_d0_10hz_lerobot"),
+        ),
+        freeze_filter=_FREEZE_MIMICGEN_BACKBONE,
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(_DEFAULT_MIMICGEN_COFFEE_OFFLINE_PARAMS),
+        num_train_steps=30_000,
+        keep_period=5_000,
+        fsdp_devices=2,
+    ),
+    # ...and LIFT adds the reactive expert (copied from the action expert), force cross-attention and wrench_gru.
+    TrainConfig(
+        name="pi05_mimicgen_coffee_reactive_frozen",
+        model=dataclasses.replace(pi05_mimicgen, reactive_in_use=True),
+        data=dataclasses.replace(
+            _MIMICGEN_COFFEE_DATA,
+            # Same action statistics as stage 1 (same data), plus the wrench statistics.
+            assets=AssetsConfig(assets_dir="assets/pi05_mimicgen_coffee_reactive", asset_id="mimicgen_coffee_d0_10hz_lerobot"),
+        ),
+        freeze_filter=_FREEZE_MIMICGEN_BACKBONE,
+        batch_size=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(_DEFAULT_MIMICGEN_COFFEE_OFFLINE_PARAMS),
+        copy_reactive_from_action_expert=True,
+        num_train_steps=30_000,
+        keep_period=5_000,
+        fsdp_devices=2,
     ),
     TrainConfig(
         name="debug",
